@@ -15,7 +15,7 @@ const app = express();
 app.use(express.json());
 
 // Allowlist origin (env or default to Vite dev)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://comfy-buttercream-04fa0d.netlify.app';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173/';
 app.use(
   cors({
     origin: ALLOWED_ORIGIN,
