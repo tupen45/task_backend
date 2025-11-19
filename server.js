@@ -23,7 +23,7 @@ const app = express();
 app.use(express.json());
 
 // Allowlist origin (env or default to Vite dev)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://raiganjtask.netlify.app';
 app.use(
   cors({
     origin: ALLOWED_ORIGIN,
