@@ -5,6 +5,11 @@ import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import Twilio from "twilio";
+import { google } from "googleapis";
+import fs from "fs";
+import path from "path";
+import ExcelJS from 'exceljs';
+import * as XLSX from "xlsx";
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET === 'dev_secret_change_me') {
@@ -23,7 +28,7 @@ const app = express();
 app.use(express.json());
 
 // Allowlist origin (env or default to Vite dev)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://raiganjtask.netlify.app';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 app.use(
   cors({
     origin: ALLOWED_ORIGIN,
@@ -50,6 +55,126 @@ const pool = mysql.createPool({
 });
 const client = Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const FROM = process.env.TWILIO_WHATSAPP_FROM;
+
+/**
+ * Convert ISO string or Date into MySQL DATETIME string "YYYY-MM-DD HH:MM:SS" (UTC)
+ * Returns null for falsy or invalid input.
+ *
+ * If you prefer server-local time for storage, set useLocalTime = true.
+ */
+// helper: convert ISO -> JS Date adjusted for timezone so MySQL DATETIME stores correct local value
+function toMySqlDate(iso) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  // adjust to remove client timezone offset so stored DATETIME matches the provided ISO local time
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////
+app.post('/reports/work-to-sheet', async (req, res) => {
+  try {
+    // 1) Query work rows with assignee and admin username
+    const sql = `
+      SELECT w.*, e.name AS assignee_name, a.username AS assign_by_name
+      FROM work w
+      LEFT JOIN employee e ON e.id = w.employee_id
+      LEFT JOIN admin a ON a.id = w.assign_by
+      ORDER BY w.start_date DESC, w.id DESC
+    `;
+    const [rows] = await pool.query(sql);
+
+    // 2) Local date formatter (same as before)
+    const formatDateTime = (raw) => {
+      if (!raw) return "-";
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return "-";
+      return d.toLocaleString('en-US', {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', hour12: true
+      });
+    };
+
+    // 3) Build workbook & worksheet
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Your API';
+    workbook.created = new Date();
+
+    const sheet = workbook.addWorksheet('work');
+
+    // Header
+    const header = [
+      "Name", "Assign", "Assign by", "Date & time", "Status", "Problem", "Contact", "Address"
+    ];
+    sheet.addRow(header);
+
+    // Add data rows
+    rows.forEach((w) => {
+      sheet.addRow([
+        w.name ?? "-",
+        w.assignee_name ?? "-",
+        w.assign_by_name ?? (w.assign_by ? `#${w.assign_by}` : "-"),
+        formatDateTime(w.start_date),
+        w.status ?? "-",
+        w.working_type ?? "-",
+        w.contact_number ?? "-",
+        w.description ?? w.address ?? "-"
+      ]);
+    });
+
+    // Style header row (bold) and freeze it
+    const headerRow = sheet.getRow(1);
+    headerRow.font = { bold: true };
+    headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
+    sheet.views = [{ state: 'frozen', ySplit: 1 }];
+
+    // Auto-width columns (simple heuristic)
+    sheet.columns = sheet.columns.map(col => {
+      const maxLength = col.values.reduce((acc, v) => {
+        const l = v ? String(v).length : 0;
+        return Math.max(acc, l);
+      }, 10);
+      return { ...col, width: Math.min(Math.max(maxLength + 2, 12), 60) }; // clamp width
+    });
+
+    // 4) Stream workbook to response as attachment
+    const filename = `work-report-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.xlsx`;
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+    // write to response stream
+    await workbook.xlsx.write(res);
+    // ensure response ends
+    res.end();
+  } catch (err) {
+    console.error('reports/work-to-sheet (xlsx) failed:', err);
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // --- routes ---
 // Send WhatsApp text via Twilio
@@ -179,8 +304,7 @@ app.post('/employees', async (req, res) => {
 
 // --- "work" endpoints for the UI ---
 
-// Add work item for employee (full fields)
-// Add work item for employee (full fields) — corrected to match the work table
+// Add work item for employee (full fields) — title optional now, dates formatted correctly
 app.post('/employees/:id/work', async (req, res) => {
   try {
     const empId = Number(req.params.id);
@@ -191,54 +315,52 @@ app.post('/employees/:id/work', async (req, res) => {
       name = null,
       assign_by = null,
       customer_id = null,
-      title,
-      working_type = 'internet issue', // set a sensible default if desired
+      title = null,
+      working_type = 'internet issue',
       contact_number = null,
       description = null,
-      start_date = null,   // expect ISO string or null
+      start_date = null, // expect ISO string or null (optional)
       end_date = null,
       status = 'Pending',
       priority = 'P0',
     } = req.body;
 
-    if (!title || !title.trim()) return res.status(400).json({ error: 'title is required' });
+    // title is optional: if blank treat as null
+    const titleValue = title && String(title).trim() ? String(title).trim() : null;
 
-    // ensure status matches table enum
+    // validate enums
     const allowedStatus = new Set(['Pending', 'Completed', 'hold', 'process']);
     if (!allowedStatus.has(status)) return res.status(400).json({ error: 'invalid status value' });
 
     const allowedPriority = new Set(['P0','P1','P2']);
     if (!allowedPriority.has(priority)) return res.status(400).json({ error: 'invalid priority value' });
 
-    // convert ISO -> JS Date (mysql2 accepts JS Date for DATETIME)
-    const toMySqlDate = (iso) => {
-      if (!iso) return null;
-      const d = new Date(iso);
-      if (isNaN(d)) return null;
-      // convert to local time without timezone offset so MySQL stores correct datetime
-      return new Date(d.getTime() - d.getTimezoneOffset() * 60000);
-    };
-
+    // convert ISO -> JS Date (or null)
+    // start_dt will be either a JS Date object or null
     const start_dt = toMySqlDate(start_date);
     const end_dt = toMySqlDate(end_date);
 
-    // Now insert all expected columns (12 columns, id auto)
+    /*
+      Use COALESCE(?, NOW()) for start_date:
+      - If start_dt is null (client omitted it) the DB will set start_date = NOW()
+      - If client provided valid start_date, that value will be used
+    */
     const [result] = await pool.query(
       `INSERT INTO work
         (name, assign_by, employee_id, customer_id, title, working_type,
          contact_number, description, start_date, end_date, status, priority)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+       VALUES (?,?,?,?,?,?,?,?,COALESCE(?, NOW()),?,?,?)`,
       [
         name ? String(name).slice(0,30) : null,
         assign_by !== null ? Number(assign_by) : null,
         empId,
         customer_id !== null ? Number(customer_id) : null,
-        title.trim(),
+        titleValue,
         working_type,
         contact_number || null,
         description || null,
-        start_dt,
-        end_dt,
+        start_dt,   // will be JS Date or null -> COALESCE handles null
+        end_dt,     // JS Date or null
         status,
         priority
       ]
@@ -266,8 +388,7 @@ app.get('/employees/:id/work', async (req, res) => {
   }
 });
 
-// Update any fields of a work item
-// Update any fields of a work item — align allowed status/priority and date names
+// Update any fields of a work item — uses same toMySqlDate helper for consistency
 app.patch('/employees/:empId/work/:workId', async (req, res) => {
   try {
     const workId = Number(req.params.workId);
@@ -293,7 +414,10 @@ app.patch('/employees/:empId/work/:workId', async (req, res) => {
     if (name !== undefined) { updates.push('name = ?'); params.push(name); }
     if (assign_by !== undefined) { updates.push('assign_by = ?'); params.push(assign_by); }
     if (customer_id !== undefined) { updates.push('customer_id = ?'); params.push(customer_id); }
-    if (title !== undefined) { updates.push('title = ?'); params.push(title); }
+    if (title !== undefined) { 
+      const titleVal = title && String(title).trim() ? String(title).trim() : null;
+      updates.push('title = ?'); params.push(titleVal); 
+    }
     if (working_type !== undefined) { updates.push('working_type = ?'); params.push(working_type); }
     if (description !== undefined) { updates.push('description = ?'); params.push(description); }
     if (contact_number !== undefined) { updates.push('contact_number = ?'); params.push(contact_number); }
@@ -311,14 +435,12 @@ app.patch('/employees/:empId/work/:workId', async (req, res) => {
     }
 
     if (start_date !== undefined) {
-      const d = start_date ? new Date(start_date) : null;
-      const v = d ? new Date(d.getTime() - d.getTimezoneOffset() * 60000) : null;
+      const v = toMySqlDate(start_date);
       updates.push('start_date = ?'); params.push(v);
     }
 
     if (end_date !== undefined) {
-      const d = end_date ? new Date(end_date) : null;
-      const v = d ? new Date(d.getTime() - d.getTimezoneOffset() * 60000) : null;
+      const v = toMySqlDate(end_date);
       updates.push('end_date = ?'); params.push(v);
     }
 
