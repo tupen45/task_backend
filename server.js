@@ -28,19 +28,23 @@ const app = express();
 app.use(express.json());
 
 // Allowlist origin (env or default to Vite dev)
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://raiganjtask.netlify.app';
+const ALLOWED_ORIGINS = [
+  'http://localhost:5173',
+  'http://enquiry.raiganjcabletv.com'
+];
+
 app.use(
   cors({
-    origin: ALLOWED_ORIGIN,
+    origin: (origin, cb) => {
+      // allow requests with no origin (Postman, server-to-server)
+      if (!origin) return cb(null, true);
+      if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+      return cb(new Error('CORS policy: origin not allowed'));
+    },
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
+    allowedHeaders: ['Content-Type', 'Authorization']
   })
 );
-// Optional: generic preflight fallback (safe with Express 5)
-app.use((req, res, next) => {
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
-  next();
-});
 
 // --- db pool ---
 const pool = mysql.createPool({
