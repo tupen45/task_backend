@@ -45,6 +45,11 @@ app.use(
     allowedHeaders: ['Content-Type', 'Authorization']
   })
 );
+// Optional: generic preflight fallback (safe with Express 5)
+app.use((req, res, next) => {
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
 // --- db pool ---
 const pool = mysql.createPool({
@@ -74,6 +79,214 @@ function toMySqlDate(iso) {
   // adjust to remove client timezone offset so stored DATETIME matches the provided ISO local time
   return new Date(d.getTime() - d.getTimezoneOffset() * 60000);
 }
+function authMiddleware(req, res, next) {
+  const auth = req.headers.authorization;
+
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const token = auth.split(" ")[1];
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    return res.status(403).json({ error: "Invalid Token" });
+  }
+}
+
+
+
+
+
+// --- work: generic endpoints (add these before app.listen) ---
+
+/**
+ * Helper to normalize DB row into frontend-friendly shape
+ * (keeps same keys your React expects: id, name/title, description, start_date, etc.)
+ */
+// --- work: generic endpoints (robust admin column handling) ---
+
+/**
+ * Helper to normalize DB row into frontend-friendly shape
+ * (keeps same keys your React expects: id, name/title, description, start_date, etc.)
+ */
+function normalizeRowForFrontend(w, adminMap = {}) {
+  const title = w.title || w.name || null;
+  const assignById = w.assign_by ?? w.assign_id ?? null;
+  const employeeId = w.employee_id ?? w.employee ?? null;
+
+  return {
+    id: w.id,
+    name: w.name ?? title,
+    title,
+    description: w.description ?? w.address ?? "",
+    working_type: w.working_type ?? w.priority ?? null,
+    contact_number: w.contact_number ?? w.contact ?? null,
+    start_date: w.start_date ? new Date(w.start_date).toISOString().slice(0, 19).replace("T", " ") : null,
+    end_date: w.end_date ? new Date(w.end_date).toISOString().slice(0, 19).replace("T", " ") : null,
+    status: w.status ?? null,
+    priority: w.priority ?? w.working_type ?? null,
+    customer_id: w.customer_id ?? null,
+    employee_id: employeeId,
+    assign_by: assignById,
+    assign_by_name: assignById ? (adminMap[String(assignById)] ?? `#${assignById}`) : null,
+    created_at: w.created_at ? new Date(w.created_at).toISOString().slice(0, 19).replace("T", " ") : null,
+    address: w.address ?? null,
+    _raw: w
+  };
+}
+
+/** GET /work - all rows (debug / fallback) */
+app.get('/work', async (req, res) => {
+  try {
+    const [rows] = await pool.query('SELECT * FROM `work` ORDER BY id DESC LIMIT 1000');
+
+    // fetch admins; be permissive about available columns
+    const [admins] = await pool.query('SELECT id, username FROM admin');
+    const adminMap = {};
+    admins.forEach(a => {
+      if (a && a.id !== undefined) {
+        // prefer fullname, then username, then fallback id
+        adminMap[String(a.id)] = a.username ?? `#${a.id}`;
+      }
+    });
+
+    const out = rows.map(r => normalizeRowForFrontend(r, adminMap));
+    res.json(out);
+  } catch (err) {
+    console.error('GET /work failed:', err?.message || err);
+    res.status(500).json({ error: 'Failed to load work', detail: err?.message || String(err) });
+  }
+});
+
+/** GET /work/unassigned - rows where employee_id IS NULL AND assign_by IS NULL */
+app.get('/work/unassigned', async (req, res) => {
+  try {
+    const sql = `
+      SELECT w.*
+      FROM work w
+      WHERE (w.employee_id IS NULL OR w.employee_id = 0)
+        AND (w.assign_by IS NULL OR w.assign_by = 0)
+      ORDER BY w.start_date DESC, w.id DESC
+      LIMIT 1000
+    `;
+    const [rows] = await pool.query(sql);
+
+    // permissive admin map (only use columns we know exist)
+    const [admins] = await pool.query('SELECT id, username FROM admin');
+    const adminMap = {};
+    admins.forEach(a => {
+      if (a && a.id !== undefined) adminMap[String(a.id)] = a.username ?? `#${a.id}`;
+    });
+
+    const out = rows.map(r => normalizeRowForFrontend(r, adminMap));
+    res.json(out);
+  } catch (err) {
+    console.error('GET /work/unassigned failed:', err?.message || err);
+    res.status(500).json({ error: 'Failed to load unassigned work', detail: err?.message || String(err) });
+  }
+});
+
+/**
+ * PATCH /work/:id
+ * Accepts same fields as /employees/:empId/work/:workId route but works on generic work id.
+ */
+app.patch('/work/:id', async (req, res) => {
+  try {
+    const workId = Number(req.params.id);
+    if (!workId) return res.status(400).json({ error: 'invalid work id' });
+
+    const updates = [];
+    const params = [];
+
+    const {
+      name,
+      assign_by,
+      assign_by_id,
+      assign_id,
+      employee_id,
+      assignee_id,
+      assign_id_new,
+      customer_id,
+      title,
+      working_type,
+      description,
+      contact_number,
+      status,
+      priority,
+      start_date,
+      end_date,
+    } = req.body;
+
+    const push = (col, val) => { updates.push(`${col} = ?`); params.push(val); };
+
+    if (name !== undefined) push('name', name);
+    if (assign_by !== undefined) push('assign_by', assign_by);
+    if (assign_by_id !== undefined) push('assign_by', assign_by_id);
+    if (assign_id !== undefined) push('assign_by', assign_id);
+    if (employee_id !== undefined) push('employee_id', employee_id);
+    if (assignee_id !== undefined) push('employee_id', assignee_id);
+    if (assign_id_new !== undefined) push('employee_id', assign_id_new);
+    if (customer_id !== undefined) push('customer_id', customer_id);
+
+    if (title !== undefined) {
+      const titleVal = title && String(title).trim() ? String(title).trim() : null;
+      push('title', titleVal);
+    }
+
+    if (working_type !== undefined) push('working_type', working_type);
+    if (description !== undefined) push('description', description);
+    if (contact_number !== undefined) push('contact_number', contact_number);
+
+    if (status !== undefined) {
+      const allowedStatus = new Set(['Pending', 'Completed', 'hold', 'process']);
+      if (!allowedStatus.has(status)) return res.status(400).json({ error: 'invalid status value' });
+      push('status', status);
+    }
+
+    if (priority !== undefined) {
+      const allowedPriority = new Set(['P0','P1','P2']);
+      if (!allowedPriority.has(priority)) return res.status(400).json({ error: 'invalid priority value' });
+      push('priority', priority);
+    }
+
+    if (start_date !== undefined) {
+      const v = toMySqlDate(start_date);
+      push('start_date', v);
+    }
+
+    if (end_date !== undefined) {
+      const v = toMySqlDate(end_date);
+      push('end_date', v);
+    }
+
+    if (!updates.length) return res.status(400).json({ error: 'no fields to update' });
+
+    params.push(workId);
+    const sql = `UPDATE work SET ${updates.join(', ')} WHERE id = ?`;
+    await pool.query(sql, params);
+
+    const [rows] = await pool.query('SELECT * FROM work WHERE id = ?', [workId]);
+    if (!rows.length) return res.status(404).json({ error: 'not found' });
+
+    const [admins] = await pool.query('SELECT id, username FROM admin');
+    const adminMap = {};
+    admins.forEach(a => {
+      if (a && a.id !== undefined) adminMap[String(a.id)] =a.username ?? `#${a.id}`;
+    });
+
+    const row = normalizeRowForFrontend(rows[0], adminMap);
+    res.json(row);
+  } catch (err) {
+    console.error('PATCH /work/:id failed:', err?.message || err);
+    res.status(500).json({ error: 'Update work failed', detail: err?.message || String(err) });
+  }
+});
+
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
 app.post('/reports/work-to-sheet', async (req, res) => {
@@ -568,17 +781,45 @@ app.post('/customer', async (req, res) => {
 });
 // customer list 
 // GET /customer  → list all
+// GET /customer  → list all or filter by phone/mobile
 app.get('/customer', async (req, res) => {
   try {
+    const { phone } = req.query;
+
+    // If no phone query, return full list (old behavior)
+    if (!phone) {
+      const [rows] = await pool.query(
+        `SELECT * FROM customer ORDER BY id DESC`
+      );
+      return res.json(rows);
+    }
+
+    // ---- If ?phone= is present, FILTER ----
+    // Normalize: keep only digits, then last 10 digits
+    let normalized = String(phone).replace(/\D/g, '');
+    if (normalized.length > 10) {
+      normalized = normalized.slice(-10);
+    }
+
+    if (!normalized || normalized.length !== 10) {
+      return res.status(400).json({ error: 'invalid phone format' });
+    }
+
+    // Try match against mobile or secondary_mobile
     const [rows] = await pool.query(
-      `SELECT * FROM customer ORDER BY id DESC`
+      `SELECT * FROM customer
+       WHERE mobile = ? OR secondary_mobile = ?
+       ORDER BY id DESC`,
+      [normalized, normalized]
     );
-    res.json(rows);
+
+    return res.json(rows);
   } catch (err) {
     console.error("Fetch customers failed:", err.message);
-    res.status(500).json({ error: "Fetch customers failed" });
+    res.status(500).json({ error: "Fetch customers failed", detail: err.message });
   }
 });
+
 //update customer
 // PATCH /customer/:id  → update customer
 app.patch('/customer/:id', async (req, res) => {
